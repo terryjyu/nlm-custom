@@ -30,6 +30,8 @@ message Artifact {
     AudioOverview audio_overview = 8;
     Report tailored_report = 9;
     App app = 10;
+    string title = 11;
+    string image_url = 12;
 }
 
 enum ArtifactType {
@@ -38,13 +40,16 @@ enum ArtifactType {
     ARTIFACT_TYPE_AUDIO_OVERVIEW = 2;
     ARTIFACT_TYPE_REPORT = 3;
     ARTIFACT_TYPE_APP = 4;
+    ARTIFACT_TYPE_YOUTUBE_VIDEO = 5;
+    ARTIFACT_TYPE_VIDEO_OVERVIEW = 6;
+    ARTIFACT_TYPE_INFOGRAPHIC = 7;
 }
 
 enum ArtifactState {
     ARTIFACT_STATE_UNSPECIFIED = 0;
     ARTIFACT_STATE_CREATING = 1;
-    ARTIFACT_STATE_READY = 2;
-    ARTIFACT_STATE_FAILED = 3;
+    ARTIFACT_STATE_FAILED = 2;
+    ARTIFACT_STATE_READY = 3;
 }
 
 message ArtifactSource {

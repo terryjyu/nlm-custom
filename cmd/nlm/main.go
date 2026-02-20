@@ -47,7 +47,7 @@ type ChatSession struct {
 
 // ChatMessage represents a single message in the conversation
 type ChatMessage struct {
-	Role      string    `json:"role"`      // "user" or "assistant"
+	Role      string    `json:"role"` // "user" or "assistant"
 	Content   string    `json:"content"`
 	Timestamp time.Time `json:"timestamp"`
 }
@@ -102,6 +102,10 @@ func init() {
 		fmt.Fprintf(os.Stderr, "  video-create <id> <instructions>  Create video overview\n")
 		fmt.Fprintf(os.Stderr, "  video-download <id> [filename]  Download video file (requires --direct-rpc)\n\n")
 
+		fmt.Fprintf(os.Stderr, "Infographic Commands:\n")
+		fmt.Fprintf(os.Stderr, "  infographic-create <id>  Create infographic overview (creates an artifact)\n")
+		fmt.Fprintf(os.Stderr, "  infographic-download <id> [filename]    Download infographic (requires --direct-rpc)\n\n")
+
 		fmt.Fprintf(os.Stderr, "Artifact Commands:\n")
 		fmt.Fprintf(os.Stderr, "  create-artifact <id> <type>  Create artifact (note|audio|report|app)\n")
 		fmt.Fprintf(os.Stderr, "  get-artifact <artifact-id>  Get artifact details\n")
@@ -152,6 +156,7 @@ func main() {
 	flag.Parse()
 
 	if debug {
+		os.Setenv("NLM_DEBUG", "true")
 		fmt.Fprintf(os.Stderr, "nlm: debug mode enabled\n")
 		if chromeProfile != "" {
 			// Mask potentially sensitive profile names in debug output
@@ -257,6 +262,16 @@ func validateArgs(cmd string, args []string) error {
 	case "video-download":
 		if len(args) < 1 || len(args) > 2 {
 			fmt.Fprintf(os.Stderr, "usage: nlm video-download <notebook-id> [filename]\n")
+			return fmt.Errorf("invalid arguments")
+		}
+	case "infographic-create":
+		if len(args) != 1 {
+			fmt.Fprintf(os.Stderr, "usage: nlm infographic-create <notebook-id>\n")
+			return fmt.Errorf("invalid arguments")
+		}
+	case "infographic-download":
+		if len(args) < 1 || len(args) > 2 {
+			fmt.Fprintf(os.Stderr, "usage: nlm infographic-download <notebook-id> [filename]\n")
 			return fmt.Errorf("invalid arguments")
 		}
 	case "audio-create":
@@ -418,6 +433,7 @@ func isValidCommand(cmd string) bool {
 		"sources", "add", "rm-source", "rename-source", "refresh-source", "check-source", "discover-sources",
 		"notes", "new-note", "update-note", "rm-note",
 		"audio-create", "audio-get", "audio-rm", "audio-share", "audio-list", "audio-download", "video-create", "video-list", "video-download",
+		"infographic-create", "infographic-download",
 		"create-artifact", "get-artifact", "list-artifacts", "artifacts", "rename-artifact", "delete-artifact",
 		"generate-guide", "generate-outline", "generate-section", "generate-magic", "generate-mindmap", "generate-chat", "chat", "chat-list",
 		"rephrase", "expand", "summarize", "critique", "brainstorm", "verify", "explain", "outline", "study-guide", "faq", "briefing-doc", "mindmap", "timeline", "toc",
@@ -737,6 +753,14 @@ func runCmd(client *api.Client, cmd string, args ...string) error {
 			filename = args[1]
 		}
 		err = downloadVideoOverview(client, args[0], filename)
+	case "infographic-create":
+		err = executeCreateInfographic(client, args[0])
+	case "infographic-download":
+		filename := ""
+		if len(args) > 1 {
+			filename = args[1]
+		}
+		err = downloadInfographic(client, args[0], filename)
 
 	// Artifact operations
 	case "create-artifact":
@@ -1401,8 +1425,10 @@ func createArtifact(c *api.Client, projectID, artifactType string) error {
 		aType = pb.ArtifactType_ARTIFACT_TYPE_REPORT
 	case "app":
 		aType = pb.ArtifactType_ARTIFACT_TYPE_APP
+	case "infographic":
+		aType = pb.ArtifactType_ARTIFACT_TYPE_INFOGRAPHIC
 	default:
-		return fmt.Errorf("invalid artifact type: %s (valid: note, audio, report, app)", artifactType)
+		return fmt.Errorf("invalid artifact type: %s (valid: note, audio, report, app, infographic)", artifactType)
 	}
 
 	req := &pb.CreateArtifactRequest{
@@ -2300,4 +2326,58 @@ func downloadVideoOverview(c *api.Client, notebookID string, filename string) er
 	}
 
 	return nil
+}
+
+func executeCreateInfographic(c *api.Client, projectID string) error {
+	fmt.Printf("Creating infographic overview for notebook %s...\n", projectID)
+
+	// Infographics do not take instructions in the API, we just pass the language
+	result, err := c.CreateInfographic(projectID, "en-US")
+	if err != nil {
+		return fmt.Errorf("create infographic: %w", err)
+	}
+
+	if !result.IsReady {
+		fmt.Println("✅ Infographic creation started. Generation may take several minutes.")
+		fmt.Printf("  Project ID: %s\n", result.ProjectID)
+		return nil
+	}
+
+	fmt.Printf("✅ Infographic created:\n")
+	fmt.Printf("  Title: %s\n", result.Title)
+	fmt.Printf("  ID: %s\n", result.VideoID) // Using VideoID field as generic ID returned by Create API
+
+	return nil
+}
+
+func downloadInfographic(c *api.Client, notebookID string, filename string) error {
+	fmt.Printf("Downloading infographic for notebook %s...\n", notebookID)
+
+	if filename == "" {
+		filename = fmt.Sprintf("infographic_%s.png", notebookID)
+	}
+
+	// First, list artifacts to find the infographic
+	artifacts, err := c.ListArtifacts(notebookID)
+	if err != nil {
+		return fmt.Errorf("list artifacts: %w", err)
+	}
+
+	var infographicArtifact *pb.Artifact
+	for _, a := range artifacts {
+		if a.Type == pb.ArtifactType_ARTIFACT_TYPE_INFOGRAPHIC && a.State == pb.ArtifactState_ARTIFACT_STATE_READY {
+			infographicArtifact = a
+			break
+		}
+	}
+
+	if infographicArtifact == nil {
+		return fmt.Errorf("no ready infographic found in project %s", notebookID)
+	}
+
+	fmt.Printf("Parsed Infographic Image URL: %s\n", infographicArtifact.ImageUrl)
+
+	// App type artifacts in NotebookLM return an app ID that can sometimes map to resources
+	// However NotebookLM Infographics are actually downloaded as an image using a different authenticated HTTP fetch
+	return c.DownloadArtifactImage(notebookID, infographicArtifact, filename)
 }
