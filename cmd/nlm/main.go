@@ -1232,6 +1232,9 @@ func createAudioOverview(c *api.Client, projectID string, instructions string) e
 	fmt.Printf("Creating audio overview for notebook %s...\n", projectID)
 	fmt.Printf("Instructions: %s\n", instructions)
 
+	// Force direct RPC to hit the custom R7cb6c implementation instead of generated proto
+	c.SetUseDirectRPC(true)
+
 	result, err := c.CreateAudioOverview(projectID, instructions)
 	if err != nil {
 		return fmt.Errorf("create audio overview: %w", err)
@@ -2172,7 +2175,7 @@ func startAutoRefreshIfEnabled() {
 func createVideoOverview(c *api.Client, projectID string, instructions string) error {
 	fmt.Printf("Creating video overview for notebook %s...\n", projectID)
 	fmt.Printf("Instructions: %s\n", instructions)
-
+	c.SetUseDirectRPC(true)
 	result, err := c.CreateVideoOverview(projectID, instructions)
 	if err != nil {
 		return fmt.Errorf("create video overview: %w", err)

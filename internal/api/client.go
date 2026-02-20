@@ -635,14 +635,60 @@ func (c *Client) CreateAudioOverview(projectID string, instructions string) (*Au
 }
 
 // createAudioOverviewDirectRPC uses direct RPC calls (original implementation)
+// createAudioOverviewDirectRPC uses direct RPC calls (newer implementation mapping to R7cb6c)
 func (c *Client) createAudioOverviewDirectRPC(projectID string, instructions string) (*AudioOverviewResult, error) {
-	resp, err := c.rpc.Do(rpc.Call{
-		ID: rpc.RPCCreateAudioOverview,
-		Args: []interface{}{
-			projectID,
-			0, // audio_type
-			[]string{instructions},
+	// 1. Get sources from the project
+	project, err := c.GetProject(projectID)
+	if err != nil {
+		return nil, fmt.Errorf("get sources: %w", err)
+	}
+
+	if len(project.Sources) == 0 {
+		return nil, fmt.Errorf("no sources in project")
+	}
+
+	// 2. Build the source ID array (for all sources or just the first)
+	// Example valid browser payload: [["e0925968-07ed-4988-8965-79400d644247"]]
+	var sourceIDs []interface{}
+	for _, src := range project.Sources {
+		// Just pull the raw string out of the protobuf message
+		sourceIDs = append(sourceIDs, []interface{}{src.SourceId.SourceId})
+	}
+
+	// 3. Construct the complex nested arguments for R7cb6c (Audio Artifact Generation)
+	// Payload mapped from: [[2,null,null,[1,null,null,null,null,null,null,null,null,null,[1]],[[1]]], "projectID", [null, ["instructions", 2, null, [sourceIDs], "en", true, 1]]]
+	audioArgs := []interface{}{
+		[]interface{}{
+			2, nil, nil,
+			[]interface{}{1, nil, nil, nil, nil, nil, nil, nil, nil, nil, []interface{}{1}},
+			[]interface{}{[]interface{}{1}},
 		},
+		projectID,
+		[]interface{}{
+			nil,
+			nil,
+			1,
+			[]interface{}{sourceIDs}, // Included sources (outer layer)
+			nil,
+			nil,
+			[]interface{}{
+				nil,
+				[]interface{}{
+					instructions, // Custom Prompt
+					2,            // Type (2 = Audio Guide?)
+					nil,
+					sourceIDs, // Included sources (inner layer)
+					"en",      // Language
+					nil,       // true changed to nil based on browser capture
+					1,
+				},
+			},
+		},
+	}
+
+	resp, err := c.rpc.Do(rpc.Call{
+		ID:         rpc.RPCCreateVideoOverview, // We use R7cb6c (mapped to Video/Artifact generation)
+		Args:       audioArgs,
 		NotebookID: projectID,
 	})
 	if err != nil {
@@ -824,32 +870,45 @@ func (c *Client) CreateVideoOverview(projectID string, instructions string) (*Vi
 		return nil, fmt.Errorf("project ID required")
 	}
 	if instructions == "" {
-		return nil, fmt.Errorf("instructions required")
+		instructions = "Create a video overview of this notebook."
 	}
 
-	// Video requires source IDs - try to get them from the notebook
-	// For testing, we can also accept a hardcoded source ID
+	// Always use direct RPC for now because the orchestration service version is broken
+	return c.createVideoOverviewDirectRPC(projectID, instructions)
+}
+
+func (c *Client) createVideoOverviewDirectRPC(projectID string, instructions string) (*VideoOverviewResult, error) {
+	// 1. Get sources from the project
+	project, err := c.GetProject(projectID)
+	if err != nil {
+		return nil, fmt.Errorf("get sources: %w", err)
+	}
+
+	if len(project.Sources) == 0 {
+		return nil, fmt.Errorf("no sources in project")
+	}
+
+	// 2. Build the source IDs array
+	// Browser format for Video sources seems to be heavily nested: [[["uuid"]]]
 	var sourceIDs []interface{}
-
-	// Try to get sources from the project
-	// For now, use hardcoded test source ID if available
-	testSourceID := "d7236810-f298-4119-a289-2b8a98170fbd"
-	if testSourceID != "" {
-		sourceIDs = []interface{}{[]interface{}{testSourceID}}
-	} else {
-		sourceIDs = []interface{}{[]interface{}{}} // Empty nested array
+	for _, src := range project.Sources {
+		sourceIDs = append(sourceIDs, []interface{}{src.SourceId.SourceId})
 	}
 
-	// Use the complex structure from the curl command
-	// Structure: [[2], "notebook-id", [null, null, 3, [[[source-id]]], null, null, null, null, [null, null, [[[source-id]], "en", "instructions"]]]]
+	// 3. Construct the complex nested arguments for R7cb6c (Video Artifact Generation)
+	// Payload mapped from: [[2,null,null,[1,null,null,null,null,null,null,null,null,null,[1]],[[1]]], "projectID", [null, null, 3, [sourceIDs(outer)], null, null, null, null, [null, null, [sourceIDs(inner), "en", "instructions", null, 1, 1]]]]
 	videoArgs := []interface{}{
-		[]interface{}{2}, // Mode
-		projectID,        // Notebook ID
+		[]interface{}{
+			2, nil, nil,
+			[]interface{}{1, nil, nil, nil, nil, nil, nil, nil, nil, nil, []interface{}{1}},
+			[]interface{}{[]interface{}{1}},
+		},
+		projectID,
 		[]interface{}{
 			nil,
 			nil,
-			3,                        // Type or version
-			[]interface{}{sourceIDs}, // Source IDs array
+			3,                        // Type (3 = Video Overview)
+			[]interface{}{sourceIDs}, // Included sources (outer layer)
 			nil,
 			nil,
 			nil,
@@ -858,64 +917,59 @@ func (c *Client) CreateVideoOverview(projectID string, instructions string) (*Vi
 				nil,
 				nil,
 				[]interface{}{
-					sourceIDs,    // Source IDs again
+					sourceIDs,    // Included sources (inner layer)
 					"en",         // Language
-					instructions, // The actual instructions
+					instructions, // Custom Prompt
+					nil,
+					1, // Format (1 = Explainer)
+					1, // Style (1 = Auto-select)
 				},
 			},
 		},
 	}
 
-	// Video args should be passed as the raw structure
-	// The batchexecute layer will handle the JSON encoding
 	resp, err := c.rpc.Do(rpc.Call{
-		ID:         rpc.RPCCreateVideoOverview,
+		ID:         rpc.RPCCreateVideoOverview, // R7cb6c
+		Args:       videoArgs,
 		NotebookID: projectID,
-		Args:       videoArgs, // Pass the structure directly
 	})
 	if err != nil {
-		return nil, fmt.Errorf("create video overview: %w", err)
+		return nil, fmt.Errorf("create video overview (direct RPC): %w", err)
 	}
 
-	// Parse response - video returns: [["video-id", "title", status, ...]]
-	var responseData []interface{}
-	if err := json.Unmarshal(resp, &responseData); err != nil {
-		// Try parsing as string then as JSON (double encoded)
+	// Parse response - same format as Audio
+	var data []interface{}
+	if err := json.Unmarshal(resp, &data); err != nil {
 		var strData string
 		if err2 := json.Unmarshal(resp, &strData); err2 == nil {
-			if err3 := json.Unmarshal([]byte(strData), &responseData); err3 != nil {
-				return nil, fmt.Errorf("parse video response: %w", err)
+			if err3 := json.Unmarshal([]byte(strData), &data); err3 != nil {
+				return nil, fmt.Errorf("parse response: %w", err)
 			}
 		} else {
-			return nil, fmt.Errorf("parse video response: %w", err)
+			return nil, fmt.Errorf("parse response JSON: %w", err)
 		}
 	}
 
 	result := &VideoOverviewResult{
 		ProjectID: projectID,
-		IsReady:   false, // Video generation is async
+		IsReady:   false,
 	}
 
-	// Extract video details from response
-	if len(responseData) > 0 {
-		if videoData, ok := responseData[0].([]interface{}); ok && len(videoData) > 0 {
-			// First element is video ID
-			if id, ok := videoData[0].(string); ok {
-				result.VideoID = id
-				if c.config.Debug {
-					fmt.Printf("Video creation initiated with ID: %s\n", id)
+	if len(data) > 0 {
+		if videoData, ok := data[0].([]interface{}); ok && len(videoData) > 0 {
+			// First element is status (2 = success?)
+			// Third element is the video/artifact ID
+			if len(videoData) > 0 {
+				if status, ok := videoData[0].(float64); ok && status == 2 {
+					result.IsReady = false
 				}
 			}
-			// Second element is title
-			if len(videoData) > 1 {
-				if title, ok := videoData[1].(string); ok {
-					result.Title = title
-				}
-			}
-			// Third element is status (1 = processing, 2 = ready?)
 			if len(videoData) > 2 {
-				if status, ok := videoData[2].(float64); ok {
-					result.IsReady = status == 2
+				if id, ok := videoData[2].(string); ok {
+					result.VideoID = id
+					if c.config.Debug {
+						fmt.Printf("Video creation initiated with ID: %s\n", id)
+					}
 				}
 			}
 		}
