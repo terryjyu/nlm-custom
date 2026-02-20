@@ -12,7 +12,9 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -633,14 +635,60 @@ func (c *Client) CreateAudioOverview(projectID string, instructions string) (*Au
 }
 
 // createAudioOverviewDirectRPC uses direct RPC calls (original implementation)
+// createAudioOverviewDirectRPC uses direct RPC calls (newer implementation mapping to R7cb6c)
 func (c *Client) createAudioOverviewDirectRPC(projectID string, instructions string) (*AudioOverviewResult, error) {
-	resp, err := c.rpc.Do(rpc.Call{
-		ID: rpc.RPCCreateAudioOverview,
-		Args: []interface{}{
-			projectID,
-			0, // audio_type
-			[]string{instructions},
+	// 1. Get sources from the project
+	project, err := c.GetProject(projectID)
+	if err != nil {
+		return nil, fmt.Errorf("get sources: %w", err)
+	}
+
+	if len(project.Sources) == 0 {
+		return nil, fmt.Errorf("no sources in project")
+	}
+
+	// 2. Build the source ID array (for all sources or just the first)
+	// Example valid browser payload: [["e0925968-07ed-4988-8965-79400d644247"]]
+	var sourceIDs []interface{}
+	for _, src := range project.Sources {
+		// Just pull the raw string out of the protobuf message
+		sourceIDs = append(sourceIDs, []interface{}{src.SourceId.SourceId})
+	}
+
+	// 3. Construct the complex nested arguments for R7cb6c (Audio Artifact Generation)
+	// Payload mapped from: [[2,null,null,[1,null,null,null,null,null,null,null,null,null,[1]],[[1]]], "projectID", [null, ["instructions", 2, null, [sourceIDs], "en", true, 1]]]
+	audioArgs := []interface{}{
+		[]interface{}{
+			2, nil, nil,
+			[]interface{}{1, nil, nil, nil, nil, nil, nil, nil, nil, nil, []interface{}{1}},
+			[]interface{}{[]interface{}{1}},
 		},
+		projectID,
+		[]interface{}{
+			nil,
+			nil,
+			1,
+			[]interface{}{sourceIDs}, // Included sources (outer layer)
+			nil,
+			nil,
+			[]interface{}{
+				nil,
+				[]interface{}{
+					instructions, // Custom Prompt
+					2,            // Type (2 = Audio Guide?)
+					nil,
+					sourceIDs, // Included sources (inner layer)
+					"en",      // Language
+					nil,       // true changed to nil based on browser capture
+					1,
+				},
+			},
+		},
+	}
+
+	resp, err := c.rpc.Do(rpc.Call{
+		ID:         rpc.RPCCreateVideoOverview, // We use R7cb6c (mapped to Video/Artifact generation)
+		Args:       audioArgs,
 		NotebookID: projectID,
 	})
 	if err != nil {
@@ -822,32 +870,45 @@ func (c *Client) CreateVideoOverview(projectID string, instructions string) (*Vi
 		return nil, fmt.Errorf("project ID required")
 	}
 	if instructions == "" {
-		return nil, fmt.Errorf("instructions required")
+		instructions = "Create a video overview of this notebook."
 	}
 
-	// Video requires source IDs - try to get them from the notebook
-	// For testing, we can also accept a hardcoded source ID
+	// Always use direct RPC for now because the orchestration service version is broken
+	return c.createVideoOverviewDirectRPC(projectID, instructions)
+}
+
+func (c *Client) createVideoOverviewDirectRPC(projectID string, instructions string) (*VideoOverviewResult, error) {
+	// 1. Get sources from the project
+	project, err := c.GetProject(projectID)
+	if err != nil {
+		return nil, fmt.Errorf("get sources: %w", err)
+	}
+
+	if len(project.Sources) == 0 {
+		return nil, fmt.Errorf("no sources in project")
+	}
+
+	// 2. Build the source IDs array
+	// Browser format for Video sources seems to be heavily nested: [[["uuid"]]]
 	var sourceIDs []interface{}
-
-	// Try to get sources from the project
-	// For now, use hardcoded test source ID if available
-	testSourceID := "d7236810-f298-4119-a289-2b8a98170fbd"
-	if testSourceID != "" {
-		sourceIDs = []interface{}{[]interface{}{testSourceID}}
-	} else {
-		sourceIDs = []interface{}{[]interface{}{}} // Empty nested array
+	for _, src := range project.Sources {
+		sourceIDs = append(sourceIDs, []interface{}{src.SourceId.SourceId})
 	}
 
-	// Use the complex structure from the curl command
-	// Structure: [[2], "notebook-id", [null, null, 3, [[[source-id]]], null, null, null, null, [null, null, [[[source-id]], "en", "instructions"]]]]
+	// 3. Construct the complex nested arguments for R7cb6c (Video Artifact Generation)
+	// Payload mapped from: [[2,null,null,[1,null,null,null,null,null,null,null,null,null,[1]],[[1]]], "projectID", [null, null, 3, [sourceIDs(outer)], null, null, null, null, [null, null, [sourceIDs(inner), "en", "instructions", null, 1, 1]]]]
 	videoArgs := []interface{}{
-		[]interface{}{2}, // Mode
-		projectID,        // Notebook ID
+		[]interface{}{
+			2, nil, nil,
+			[]interface{}{1, nil, nil, nil, nil, nil, nil, nil, nil, nil, []interface{}{1}},
+			[]interface{}{[]interface{}{1}},
+		},
+		projectID,
 		[]interface{}{
 			nil,
 			nil,
-			3,                        // Type or version
-			[]interface{}{sourceIDs}, // Source IDs array
+			3,                        // Type (3 = Video Overview)
+			[]interface{}{sourceIDs}, // Included sources (outer layer)
 			nil,
 			nil,
 			nil,
@@ -856,63 +917,150 @@ func (c *Client) CreateVideoOverview(projectID string, instructions string) (*Vi
 				nil,
 				nil,
 				[]interface{}{
-					sourceIDs,    // Source IDs again
+					sourceIDs,    // Included sources (inner layer)
 					"en",         // Language
-					instructions, // The actual instructions
+					instructions, // Custom Prompt
+					nil,
+					1, // Format (1 = Explainer)
+					1, // Style (1 = Auto-select)
 				},
 			},
 		},
 	}
 
-	// Video args should be passed as the raw structure
-	// The batchexecute layer will handle the JSON encoding
 	resp, err := c.rpc.Do(rpc.Call{
-		ID:         rpc.RPCCreateVideoOverview,
+		ID:         rpc.RPCCreateVideoOverview, // R7cb6c
+		Args:       videoArgs,
 		NotebookID: projectID,
-		Args:       videoArgs, // Pass the structure directly
 	})
 	if err != nil {
-		return nil, fmt.Errorf("create video overview: %w", err)
+		return nil, fmt.Errorf("create video overview (direct RPC): %w", err)
 	}
 
-	// Parse response - video returns: [["video-id", "title", status, ...]]
-	var responseData []interface{}
-	if err := json.Unmarshal(resp, &responseData); err != nil {
-		// Try parsing as string then as JSON (double encoded)
+	// Parse response - same format as Audio
+	var data []interface{}
+	if err := json.Unmarshal(resp, &data); err != nil {
 		var strData string
 		if err2 := json.Unmarshal(resp, &strData); err2 == nil {
-			if err3 := json.Unmarshal([]byte(strData), &responseData); err3 != nil {
-				return nil, fmt.Errorf("parse video response: %w", err)
+			if err3 := json.Unmarshal([]byte(strData), &data); err3 != nil {
+				return nil, fmt.Errorf("parse response: %w", err)
 			}
 		} else {
-			return nil, fmt.Errorf("parse video response: %w", err)
+			return nil, fmt.Errorf("parse response JSON: %w", err)
 		}
 	}
 
 	result := &VideoOverviewResult{
 		ProjectID: projectID,
-		IsReady:   false, // Video generation is async
+		IsReady:   false,
 	}
 
-	// Extract video details from response
-	if len(responseData) > 0 {
-		if videoData, ok := responseData[0].([]interface{}); ok && len(videoData) > 0 {
-			// First element is video ID
-			if id, ok := videoData[0].(string); ok {
-				result.VideoID = id
-				if c.config.Debug {
-					fmt.Printf("Video creation initiated with ID: %s\n", id)
+	if len(data) > 0 {
+		if videoData, ok := data[0].([]interface{}); ok && len(videoData) > 0 {
+			// First element is status (2 = success?)
+			// Third element is the video/artifact ID
+			if len(videoData) > 0 {
+				if status, ok := videoData[0].(float64); ok && status == 2 {
+					result.IsReady = false
 				}
 			}
-			// Second element is title
-			if len(videoData) > 1 {
-				if title, ok := videoData[1].(string); ok {
+			if len(videoData) > 2 {
+				if id, ok := videoData[2].(string); ok {
+					result.VideoID = id
+					if c.config.Debug {
+						fmt.Printf("Video creation initiated with ID: %s\n", id)
+					}
+				}
+			}
+		}
+	}
+
+	return result, nil
+}
+
+// CreateInfographic creates an infographic for a notebook using type 7 payloads
+func (c *Client) CreateInfographic(projectID string, language string) (*VideoOverviewResult, error) {
+	if projectID == "" {
+		return nil, fmt.Errorf("project ID required")
+	}
+
+	// Get all sources for the notebook
+	project, err := c.GetProject(projectID)
+	if err != nil || len(project.Sources) == 0 {
+		return nil, fmt.Errorf("could not retrieve notebook sources for infographic: %v", err)
+	}
+
+	var sourceIDs []interface{}
+	for _, src := range project.Sources {
+		if src.SourceId != nil && src.SourceId.SourceId != "" {
+			sourceIDs = append(sourceIDs, []interface{}{[]interface{}{src.SourceId.SourceId}})
+		}
+	}
+
+	if language == "" {
+		language = "en-US" // default
+	}
+
+	// Payload structure for infographic (type 7)
+	infographicArgs := []interface{}{
+		[]interface{}{
+			2, nil, nil,
+			[]interface{}{1, nil, nil, nil, nil, nil, nil, nil, nil, nil, []interface{}{1}},
+			[]interface{}{[]interface{}{1}},
+		},
+		projectID,
+		[]interface{}{
+			nil, nil, 7, sourceIDs,
+			nil, nil, nil, nil, nil, nil, nil, nil, nil, nil,
+			[]interface{}{
+				[]interface{}{
+					nil, language, nil, 1, 2,
+				},
+			},
+		},
+	}
+
+	resp, err := c.rpc.Do(rpc.Call{
+		ID:         rpc.RPCCreateVideoOverview, // "R7cb6c" handles all overviews
+		NotebookID: projectID,
+		Args:       infographicArgs,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("create infographic: %w", err)
+	}
+
+	var responseData []interface{}
+	if err := json.Unmarshal(resp, &responseData); err != nil {
+		var strData string
+		if err2 := json.Unmarshal(resp, &strData); err2 == nil {
+			if err3 := json.Unmarshal([]byte(strData), &responseData); err3 != nil {
+				return nil, fmt.Errorf("parse infographic response: %w", err)
+			}
+		} else {
+			return nil, fmt.Errorf("parse infographic response: %w", err)
+		}
+	}
+
+	result := &VideoOverviewResult{
+		ProjectID: projectID,
+		IsReady:   false,
+	}
+
+	if len(responseData) > 0 {
+		if dataArr, ok := responseData[0].([]interface{}); ok && len(dataArr) > 0 {
+			if id, ok := dataArr[0].(string); ok {
+				result.VideoID = id
+				if c.config.Debug {
+					fmt.Printf("Infographic creation initiated with ID: %s\n", id)
+				}
+			}
+			if len(dataArr) > 1 {
+				if title, ok := dataArr[1].(string); ok {
 					result.Title = title
 				}
 			}
-			// Third element is status (1 = processing, 2 = ready?)
-			if len(videoData) > 2 {
-				if status, ok := videoData[2].(float64); ok {
+			if len(dataArr) > 2 {
+				if status, ok := dataArr[2].(float64); ok {
 					result.IsReady = status == 2
 				}
 			}
@@ -1465,35 +1613,9 @@ func (r *VideoOverviewResult) saveBase64VideoToFile(base64Data, filename string)
 	return nil
 }
 
-// DownloadVideoWithAuth downloads a video using the client's authentication
+// DownloadVideoWithAuth opens a video URL in the preferred browser since direct HTTP downloads
+// often fail Google's ServiceLogin session redirect checks.
 func (c *Client) DownloadVideoWithAuth(videoURL, filename string) error {
-	// Create HTTP client with timeout
-	client := &http.Client{
-		Timeout: 300 * time.Second, // 5 minute timeout for large video downloads
-	}
-
-	// Create request
-	req, err := http.NewRequest("GET", videoURL, nil)
-	if err != nil {
-		return fmt.Errorf("create video download request: %w", err)
-	}
-
-	// Add browser-like headers
-	req.Header.Set("Accept", "*/*")
-	req.Header.Set("Accept-Language", "en-US,en;q=0.6")
-	req.Header.Set("Range", "bytes=0-")
-	req.Header.Set("Referer", "https://notebooklm.google.com/")
-	req.Header.Set("Sec-Fetch-Dest", "video")
-	req.Header.Set("Sec-Fetch-Mode", "no-cors")
-	req.Header.Set("Sec-Fetch-Site", "cross-site")
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36")
-
-	// Get cookies from environment (same as nlm client uses)
-	cookies := os.Getenv("NLM_COOKIES")
-	if cookies != "" {
-		req.Header.Set("Cookie", cookies)
-	}
-
 	// Get auth token and add as query parameter if needed
 	authToken := os.Getenv("NLM_AUTH_TOKEN")
 	if authToken != "" && !strings.Contains(videoURL, "authuser=") {
@@ -1502,46 +1624,35 @@ func (c *Client) DownloadVideoWithAuth(videoURL, filename string) error {
 		if strings.Contains(videoURL, "?") {
 			separator = "&"
 		}
-		req.URL, _ = url.Parse(videoURL + separator + "authuser=0")
+		videoURL = videoURL + separator + "authuser=0"
 	}
 
 	if c.config.Debug {
-		fmt.Printf("Downloading video from: %s\n", req.URL.String())
-		fmt.Printf("Using cookies: %v\n", cookies != "")
+		fmt.Printf("Fetching video using browser from: %s\n", videoURL)
 	}
 
-	// Make the request
-	resp, err := client.Do(req)
+	// Because NotebookLM CDN domains (like lh3.googleusercontent.com) enforce strict
+	// active browser session rules (ServiceLogin redirects) that a CLI HTTP client cannot
+	// easily traverse, we open the URL in the user's default browser where they are already logged in.
+
+	// Determine the appropriate command based on the OS
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "darwin":
+		cmd = exec.Command("open", videoURL)
+	case "windows":
+		cmd = exec.Command("cmd", "/c", "start", strings.ReplaceAll(videoURL, "&", "^&"))
+	default:
+		cmd = exec.Command("xdg-open", videoURL)
+	}
+
+	err := cmd.Start()
 	if err != nil {
-		return fmt.Errorf("download video: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
-		return fmt.Errorf("download failed with status: %s (check authentication)", resp.Status)
+		return fmt.Errorf("failed to open browser for video download: %w", err)
 	}
 
-	// Create output file
-	file, err := os.Create(filename)
-	if err != nil {
-		return fmt.Errorf("create video file: %w", err)
-	}
-	defer file.Close()
-
-	// Copy with progress if debug enabled
-	if c.config.Debug {
-		// Get content length for progress
-		contentLength := resp.ContentLength
-		if contentLength > 0 {
-			fmt.Printf("Video size: %.2f MB\n", float64(contentLength)/(1024*1024))
-		}
-	}
-
-	// Copy the video data
-	_, err = io.Copy(file, resp.Body)
-	if err != nil {
-		return fmt.Errorf("write video file: %w", err)
-	}
+	fmt.Printf("\nSUCCESS: The video URL has been opened in your default browser.\n")
+	fmt.Printf("Please download the video manually from the browser.\n")
 
 	return nil
 }
@@ -1596,6 +1707,89 @@ func (c *Client) ListArtifacts(projectID string) ([]*pb.Artifact, error) {
 	return artifacts, nil
 }
 
+// GetArtifact gets a specific artifact by ID using direct RPC
+func (c *Client) GetArtifact(artifactID string) (*pb.Artifact, error) {
+	resp, err := c.rpc.Do(rpc.Call{
+		ID: rpc.RPCGetArtifact,
+		Args: []interface{}{
+			artifactID,
+		},
+		NotebookID: "", // Not typically needed for this RPC
+	})
+	if err != nil {
+		return nil, fmt.Errorf("get artifact RPC: %w", err)
+	}
+
+	// Parse response
+	var responseData []interface{}
+	if err := json.Unmarshal(resp, &responseData); err != nil {
+		return nil, fmt.Errorf("parse artifact response: %w", err)
+	}
+
+	if c.config.Debug {
+		fmt.Printf("GetArtifact response: %+v\n", responseData)
+	}
+
+	if len(responseData) > 0 {
+		// Response is usually wrapped in an array [artifact_data]
+		if artifact := c.parseArtifactFromResponse(responseData[0]); artifact != nil {
+			return artifact, nil
+		}
+	}
+
+	return nil, fmt.Errorf("failed to parse artifact from response")
+}
+
+// DownloadArtifactImage fetches the image related to an artifact (used for infographics)
+func (c *Client) DownloadArtifactImage(projectID string, artifact *pb.Artifact, filename string) error {
+	imageURL := artifact.ImageUrl
+	if imageURL == "" {
+		if artifact.App == nil || artifact.App.AppId == "" {
+			return fmt.Errorf("artifact does not have an associated image URL or App ID")
+		}
+		// Fallback for older approach
+		imageURL = fmt.Sprintf("https://notebooklm.google.com/u/0/api/download/app/%s", artifact.App.AppId)
+	}
+
+	// Append authuser if not present to avoid Google session disambiguation redirects
+	if !strings.Contains(imageURL, "authuser=") {
+		separator := "?"
+		if strings.Contains(imageURL, "?") {
+			separator = "&"
+		}
+		imageURL = imageURL + separator + "authuser=0"
+	}
+
+	if c.config.Debug {
+		fmt.Printf("Fetching image using browser from: %s\n", imageURL)
+	}
+
+	// Because NotebookLM CDN domains (like lh3.googleusercontent.com) enforce strict
+	// active browser session rules (ServiceLogin redirects) that a CLI HTTP client cannot
+	// easily traverse, we open the URL in the user's default browser where they are already logged in.
+
+	// Determine the appropriate command based on the OS
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "darwin":
+		cmd = exec.Command("open", imageURL)
+	case "windows":
+		cmd = exec.Command("cmd", "/c", "start", strings.ReplaceAll(imageURL, "&", "^&"))
+	default:
+		cmd = exec.Command("xdg-open", imageURL)
+	}
+
+	err := cmd.Start()
+	if err != nil {
+		return fmt.Errorf("failed to open browser for image download: %w", err)
+	}
+
+	fmt.Printf("\nSUCCESS: The infographic image has been opened in your default browser.\n")
+	fmt.Printf("Please save the image manually (Right Click -> Save Image As...)\n")
+
+	return nil
+}
+
 // RenameArtifact renames an artifact using the rc3d8d RPC endpoint
 func (c *Client) RenameArtifact(artifactID, newTitle string) (*pb.Artifact, error) {
 	resp, err := c.rpc.Do(rpc.Call{
@@ -1639,28 +1833,28 @@ func (c *Client) parseArtifactFromResponse(data interface{}) *pb.Artifact {
 
 	artifact := &pb.Artifact{}
 
-	// Parse artifact ID (usually first element)
+	// Parse artifact ID (index 0)
 	if len(artifactData) > 0 {
 		if id, ok := artifactData[0].(string); ok {
 			artifact.ArtifactId = id
 		}
 	}
 
-	// Parse artifact type (usually second element)
+	// Parse artifact title (index 1)
 	if len(artifactData) > 1 {
-		if typeVal, ok := artifactData[1].(float64); ok {
+		if title, ok := artifactData[1].(string); ok {
+			artifact.Title = title
+		}
+	}
+
+	// Parse artifact type (index 2)
+	if len(artifactData) > 2 {
+		if typeVal, ok := artifactData[2].(float64); ok {
 			artifact.Type = pb.ArtifactType(int32(typeVal))
 		}
 	}
 
-	// Parse artifact state (usually third element)
-	if len(artifactData) > 2 {
-		if stateVal, ok := artifactData[2].(float64); ok {
-			artifact.State = pb.ArtifactState(int32(stateVal))
-		}
-	}
-
-	// Parse sources (if available)
+	// Parse sources (index 3)
 	if len(artifactData) > 3 {
 		if sourcesData, ok := artifactData[3].([]interface{}); ok {
 			for _, sourceData := range sourcesData {
@@ -1668,6 +1862,28 @@ func (c *Client) parseArtifactFromResponse(data interface{}) *pb.Artifact {
 					artifact.Sources = append(artifact.Sources, &pb.ArtifactSource{
 						SourceId: &pb.SourceId{SourceId: sourceId},
 					})
+				}
+			}
+		}
+	}
+
+	// Parse artifact state (index 4)
+	if len(artifactData) > 4 {
+		if stateVal, ok := artifactData[4].(float64); ok {
+			artifact.State = pb.ArtifactState(int32(stateVal))
+		}
+	}
+
+	// Try to parse ImageUrl from index 14 for Infographics
+	if artifact.Type == pb.ArtifactType_ARTIFACT_TYPE_INFOGRAPHIC && len(artifactData) > 14 {
+		if arr1, ok := artifactData[14].([]interface{}); ok && len(arr1) > 2 {
+			if arr2, ok := arr1[2].([]interface{}); ok && len(arr2) > 0 {
+				if arr3, ok := arr2[0].([]interface{}); ok && len(arr3) > 1 {
+					if imgArr, ok := arr3[1].([]interface{}); ok && len(imgArr) > 0 {
+						if imgUrl, ok := imgArr[0].(string); ok {
+							artifact.ImageUrl = imgUrl
+						}
+					}
 				}
 			}
 		}

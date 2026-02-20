@@ -12,10 +12,3 @@ plugins:
   - plugin: buf.build/grpc/go:v1.3.0
     out: ../gen
     opt: paths=source_relative
-  - plugin: anything
-    out: ../gen
-    opt:
-      - templates=templates
-      - paths=source_relative
-      - goimports=true
-    strategy: all
